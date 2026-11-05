@@ -1,3 +1,5 @@
+WIP! Not finished yet
+
 # Skate 2 PC
 
 A community Windows port of the Xbox 360 version of **Skate 2**, built with [ReXGlue](https://github.com/rexglue/rexglue-sdk).
