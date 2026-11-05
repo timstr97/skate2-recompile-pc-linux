@@ -23,6 +23,19 @@ Use the named Windows ZIP under **Releases**. GitHub's **Code → Download ZIP**
 
 Original game files are required and are not included or downloaded by this project. An ISO or compressed archive must be extracted before import.
 
+## Linux
+
+Skate 2 PC can also be built and run **natively on Linux** with Vulkan (experimental). There is no prebuilt Linux package yet; build it from source with one script:
+
+```bash
+./skate2.sh deps && ./skate2.sh bootstrap
+./skate2.sh import "/path/to/extracted/Skate 2"
+./skate2.sh build
+./skate2.sh launch
+```
+
+See the [Linux guide](docs/LINUX.md) for requirements, launch profiles, and Linux-specific notes.
+
 ## Features
 
 - Native recompiled CPU code with Direct3D 12 graphics translation.
@@ -43,6 +56,7 @@ Testing includes Free Skate, campaign progression, instant replay, save/reload, 
 | --- | --- |
 | [Installation and controls](docs/INSTALL.md) | Game revision, package setup, controller, audio, saves, and troubleshooting |
 | [Build from source](docs/BUILD.md) | Tool downloads and numbered build instructions |
+| [Linux](docs/LINUX.md) | Native Linux/Vulkan build, launch profiles, and Linux notes |
 | [Display and performance](docs/DISPLAY.md) | Rendering quality, FPS options, monitors, 4K, and ultrawide status |
 | [Known issues and roadmap](docs/KNOWN_ISSUES.md) | Current limitations and planned work |
 | [How it works](docs/HOW_IT_WORKS.md) | Recompilation approach and project credits |

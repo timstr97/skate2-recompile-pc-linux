@@ -1,0 +1,184 @@
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 696ff48..fc8132d 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -747,6 +747,20 @@ class VulkanCommandProcessor : public CommandProcessor {
+   };
+   std::array<VertexBufferState, 96> vertex_buffer_states_{};
+   uint64_t vertex_buffers_in_sync_[2] = {};
++
++  void MaybeSynchronizePresentIdleclean(uint32_t index, uint32_t value);
++  struct PresentIdlecleanDiagnostic {
++    uint64_t hits = 0;
++    uint64_t synchronized = 0;
++    uint64_t wait_calls = 0;
++    uint64_t already_complete = 0;
++    uint64_t skipped = 0;
++    uint64_t failed = 0;
++    uint64_t waited_us = 0;
++    uint32_t logged_skip_reasons = 0;
++    std::array<uint64_t, 8> skipped_by_reason = {};
++  } present_idleclean_diagnostic_;
++  bool present_idleclean_sync_enabled_ = false;
+   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
+   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+ 
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 7a7d3fe..9d5840b 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <iterator>
+@@ -64,6 +65,11 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
+                     "Submit command buffer when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_present_idleclean_sync, false, "GPU/Vulkan",
++                    "Diagnostic: await submitted rendering for WAIT_UNTIL 3D idle-clean only "
++                    "between closed guest frames. Other WAIT_UNTIL cases are unchanged.")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
+                     "device (falls back to render passes otherwise)")
+@@ -775,6 +781,9 @@ bool VulkanCommandProcessor::SetupContext() {
+     return false;
+   }
+   InvalidateAllVertexBufferResidency();
++  // Snapshot through the locked registry once on the command worker. Pending
++  // UI edits to this restart-required flag must not race live packet handling.
++  present_idleclean_sync_enabled_ = rex::cvar::Query<bool>("vulkan_present_idleclean_sync");
+ 
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+@@ -1897,6 +1906,15 @@ bool VulkanCommandProcessor::SetupContext() {
+ }
+ 
+ void VulkanCommandProcessor::ShutdownContext() {
++  if (present_idleclean_diagnostic_.hits) {
++    REXGPU_INFO("Present idle-clean diagnostic totals: hits={} synchronized={} wait_calls={} "
++                "already_complete={} skipped={} failed={} waited_us={}",
++                present_idleclean_diagnostic_.hits, present_idleclean_diagnostic_.synchronized,
++                present_idleclean_diagnostic_.wait_calls,
++                present_idleclean_diagnostic_.already_complete,
++                present_idleclean_diagnostic_.skipped, present_idleclean_diagnostic_.failed,
++                present_idleclean_diagnostic_.waited_us);
++  }
+   AwaitAllQueueOperationsCompletion();
+   InvalidateAllVertexBufferResidency();
+   ShutdownOcclusionQueryResources();
+@@ -2125,6 +2143,7 @@ void VulkanCommandProcessor::ShutdownContext() {
+ 
+ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+   CommandProcessor::WriteRegister(index, value);
++  MaybeSynchronizePresentIdleclean(index, value);
+ 
+   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+     if (frame_open_) {
+@@ -2160,6 +2179,100 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+   }
+ }
+ 
++void VulkanCommandProcessor::MaybeSynchronizePresentIdleclean(uint32_t index, uint32_t value) {
++  // Vulkan port of the D3D12 idle-clean synchronization. PM4 register writes
++  // run on the command worker. This is deliberately not a complete WAIT_UNTIL
++  // implementation: do not close partial frames, submissions or queries.
++  if (index != XE_GPU_REG_WAIT_UNTIL || !(value & (UINT32_C(1) << 17)) ||
++      !present_idleclean_sync_enabled_) {
++    return;
++  }
++  auto& stats = present_idleclean_diagnostic_;
++  ++stats.hits;
++  const uint64_t current = GetCurrentSubmission();
++  const uint64_t target = current ? current - 1 : 0;
++  const uint64_t completed_before = submission_completed_;
++  const char* reason = "none";
++  uint32_t skip_bit = 0;
++  if (device_lost_) {
++    reason = "device_lost"; skip_bit = 1u << 0;
++  } else if (current <= 1) {
++    reason = "no_submitted_frame"; skip_bit = 1u << 2;
++  } else if (frame_open_) {
++    reason = "frame_open"; skip_bit = 1u << 3;
++  } else if (submission_open_) {
++    reason = "submission_open"; skip_bit = 1u << 4;
++  } else if (active_occlusion_query_.valid) {
++    reason = "occlusion_query_active"; skip_bit = 1u << 5;
++  } else if (scratch_buffer_used_) {
++    reason = "scratch_buffer_active"; skip_bit = 1u << 6;
++  }
++
++  uint64_t waited_us = 0;
++  uint64_t completed_after = completed_before;
++  bool log_detail = false;
++  if (skip_bit) {
++    ++stats.skipped;
++    for (uint32_t i = 0; i < stats.skipped_by_reason.size(); ++i) {
++      if (skip_bit == (1u << i)) ++stats.skipped_by_reason[i];
++    }
++    log_detail = !(stats.logged_skip_reasons & skip_bit);
++    stats.logged_skip_reasons |= skip_bit;
++  } else {
++    const auto start = std::chrono::steady_clock::now();
++    VkResult wait_result = VK_SUCCESS;
++    const bool already_complete = completed_before >= target;
++    if (!already_complete && !submissions_in_flight_fences_.empty()) {
++      // Bounded wait for every in-flight submission (all are < current since no
++      // submission is open). Never call the general helper with current: it
++      // could close a submission.
++      const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++      const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++      ++stats.wait_calls;
++      wait_result = dfn.vkWaitForFences(
++          vulkan_device->device(), uint32_t(target - completed_before),
++          submissions_in_flight_fences_.data(), VK_TRUE, UINT64_C(5000000000));
++    }
++    if (wait_result == VK_SUCCESS) {
++      // Reclaim fences and resources now that completion is verified. Target 0
++      // never ends a submission because current >= 2.
++      CheckSubmissionFenceAndDeviceLoss(0);
++    }
++    completed_after = submission_completed_;
++    waited_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++        std::chrono::steady_clock::now() - start).count());
++    stats.waited_us += waited_us;
++    if (wait_result != VK_SUCCESS || device_lost_ || completed_after < target) {
++      ++stats.failed;
++      if (wait_result == VK_ERROR_DEVICE_LOST) device_lost_ = true;
++      REXGPU_ERROR("Present idle-clean diagnostic FAILED: value={:08X} current={} target={} "
++                   "completed_before={} completed_after={} waited_us={} hits={} "
++                   "wait_result={}",
++                   value, current, target, completed_before, completed_after, waited_us,
++                   stats.hits, int32_t(wait_result));
++      rex::FatalError("The optional present idle-clean diagnostic could not verify GPU completion.");
++    }
++    ++stats.synchronized;
++    if (already_complete) ++stats.already_complete;
++    log_detail = stats.synchronized <= 8;
++  }
++  // First eight successes, each skip reason once, and at most thirty periodic
++  // summaries spanning menus and gameplay. No per-frame or unbounded log stream.
++  if (log_detail || (stats.hits <= 18000 && stats.hits % 600 == 0)) {
++    REXGPU_INFO("Present idle-clean diagnostic: value={:08X} current={} target={} "
++                "completed_before={} completed_after={} waited_us={} skipped_reason={} "
++                "hits={} synchronized={} wait_calls={} already_complete={} skipped={} failed={} "
++                "total_waited_us={} skipped_by_reason=[lost:{},empty:{},frame:{},"
++                "submission:{},query:{},scratch:{}]",
++                value, current, target, completed_before, completed_after, waited_us, reason,
++                stats.hits, stats.synchronized, stats.wait_calls, stats.already_complete,
++                stats.skipped, stats.failed, stats.waited_us, stats.skipped_by_reason[0],
++                stats.skipped_by_reason[2], stats.skipped_by_reason[3],
++                stats.skipped_by_reason[4], stats.skipped_by_reason[5],
++                stats.skipped_by_reason[6]);
++  }
++}
++
+ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
+                                                    uint32_t num_registers) {
+   if (!num_registers) {

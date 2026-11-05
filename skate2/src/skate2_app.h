@@ -34,9 +34,13 @@ class Skate2App : public rex::ReXApp {
                             "readback_memexport", "readback_memexport_fast",
                             "clear_memory_page_state", "render_target_path_d3d12",
                             "vsync", "video_mode_refresh_rate",
-                            "d3d12_present_idleclean_sync", "skate2_frame_rate",
+                            "d3d12_present_idleclean_sync", "render_target_path_vulkan",
+                            "vulkan_present_idleclean_sync", "skate2_frame_rate",
                             "resolution_scale", "draw_resolution_scale_x",
                             "draw_resolution_scale_y"}) {
+      // Each build registers only its own backend's flags (D3D12 on Windows,
+      // Vulkan elsewhere); skip the other backend's names.
+      if (!rex::cvar::GetFlagInfo(flag)) continue;
       REXLOG_INFO("Graphics setting {}={}", flag, rex::cvar::GetFlagByName(flag));
     }
     // The SDK exposes per-frame CSV counters but does not open the configured
@@ -112,7 +116,11 @@ class Skate2App : public rex::ReXApp {
       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error,
           "Skate 2 game files are missing. Expected default.xex and the data folder in:\n" +
           game_data_root().string() +
+#if defined(_WIN32)
           "\n\nUse Launch Skate 2.cmd or place your extracted game in the game folder.");
+#else
+          "\n\nRun ./skate2.sh import <folder> or place your extracted game in the game folder.");
+#endif
       return false;
     }
     return true;

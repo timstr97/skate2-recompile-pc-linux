@@ -2,6 +2,8 @@
 
 These instructions build the Windows x64 version, including its patched ReXGlue runtime. A fresh SDK build, game-code generation, and application compilation have completed in an isolated directory on the development PC. Running the resulting build on a clean Windows installation remains a separate validation step.
 
+**Building on Linux?** Follow the [Linux guide](LINUX.md) instead; it uses `skate2.sh` and the Vulkan backend.
+
 **Only looking to play?** Use the compiled Windows ZIP and [installation guide](INSTALL.md). This build guide is for contributors.
 
 ## 1. Install the build tools

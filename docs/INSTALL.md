@@ -6,7 +6,7 @@ Download **Skate2-PC-v0.1.1-Windows-x64.zip** from [Releases](https://github.com
 
 | Item | Requirement |
 | --- | --- |
-| Operating system | Windows 10/11 x64; Linux, macOS, and Windows on ARM are not supported by this build |
+| Operating system | Windows 10/11 x64 for this package; Linux can build from source ([Linux guide](LINUX.md)); macOS and Windows on ARM are not supported |
 | Processor | Intel/AMD processor supporting x86-64-v2, the SDK's build target |
 | Graphics | Direct3D 12 GPU and driver; minimum GPU/VRAM requirements have not been established |
 | Input | A controller; USB DualSense has direct input support without DS4Windows |
